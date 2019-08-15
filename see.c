@@ -23,6 +23,18 @@ struct seeConfig {
   int xcursor, ycursor;                                       // Cursor position
 };
 
+enum kPress {                                                 // Helps with arrow key / WASD / fxn aliasing
+  ARROW_LEFT = 'a',
+  ARROW_RIGHT = 'd',
+  ARROW_UP = 'w',
+  ARROW_DOWN = 's',
+  PAGE_UP = 'z',
+  PAGE_DOWN = 'c',
+  DEL_KEY = 'x',
+  HOME_KEY = '1',
+  END_KEY = '3',
+};
+
 struct seeConfig config;
 
 
@@ -81,9 +93,45 @@ char readKey() {                                              // Wait for a keyp
   nrStat = read(STDIN_FILENO, &buf, 1);                       // o b t a i n
   if (nrStat == -1 && errno != EAGAIN) suicide("readKey.read");// death and destruction / error handling 
 
-  
-  
-  return buf;
+  if (buf == '\x1b') {                                        // Detect escape key -> arrow keys?
+    char seq[3];                                              // If we got one, IMMEDIATELY read new bytes
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';   // Timeout?
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';   // Maybe this just up and doesn't happen, needed
+    
+    if (seq[0] == '[') {                                      // Correct kind of start sequence? If so
+      if (seq[1] >= '0' && seq[1] <= '9') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';// Read in aanother boi and hope it's a ~ for pgops
+        if (seq[2] ==  '~') {                                 // If we have a match, return the correct keys
+          switch (seq[1]) {                                   // And multiplex the controls
+            case '1': return HOME_KEY;
+            case '3': return DEL_KEY;
+            case '4': return END_KEY;
+            case '5': return PAGE_UP;
+            case '6': return PAGE_DOWN;
+            case '7': return HOME_KEY;                        // Multiple possibilities dependent on emulator
+            case '8': return END_KEY;
+          }
+        }
+      } else {                                                // This fails, still might be an arrow key
+        switch (seq[1]) {                                     // If arrow key combos, return the right kind
+          case 'A': return ARROW_UP;
+          case 'B': return ARROW_DOWN;
+          case 'C': return ARROW_RIGHT;
+          case 'D': return ARROW_LEFT;
+          case 'H': return HOME_KEY;
+          case 'F': return END_KEY;
+        }
+      }
+    } else if (seq[0] == 'O') {                               // Yet further HOME possibilities...
+      switch (seq[1]) {
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
+      } 
+    }
+    return '\x1b';                                            // Something else. Who knows what else is in there?
+  } else {
+    return buf;                                               // Normal key handling
+  }
 }
 
 int windowSize(int *rows, int *cols) {                        // pass destination mem locations for us to load
@@ -178,23 +226,27 @@ void refreshScreen() {
 
 void mvCursor(char keyPressed) {                              // Update cursor position based on WASD keys
   switch (keyPressed) {
-    case 'a':
-      config.xcursor--;
+    case ARROW_LEFT:
+      if (config.xcursor != 0) config.xcursor--;              // Do bounds checking for all cases
       break;
-    case 'd':
-      config.xcursor++;
+    case ARROW_RIGHT:
+      if (config.xcursor != (config.cols-1)) config.xcursor++;
       break;
-    case 'w':
-      config.ycursor--;
+    case ARROW_UP:
+      if (config.ycursor != 0) config.ycursor--;
       break;
-    case 's':
-      config.ycursor++;
+    case ARROW_DOWN:
+      if (config.ycursor != (config.rows-1)) config.ycursor++;
       break;
   }
 }
 
 void procKeypress() {
   char c = readKey();                                         // Get the next keypress, blocking til it arrives
+ 
+  // DEBUG
+  // printf("Key pressed: %d (%c)", c, c);
+
   switch (c) {                                                // Processing time - using 'q' as the quit key
     case 'q':                                                 // If it is indeed the quit key...
       write(STDOUT_FILENO, "\x1b[2J", 4);                     // x1b J2 to clear the screen
@@ -203,12 +255,28 @@ void procKeypress() {
       break;                          
   
     /// Generalize the directional keypresses and interface via a subfunction (above)
-    case 'w':
-    case 'a':
-    case 's':
-    case 'd':
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
       mvCursor(c);
       break;
+
+    /// Pg up / pg down operations consist of consecutive cursor moves to the top/bottom
+    case PAGE_UP:
+    case PAGE_DOWN: {
+      int lc = config.rows;
+      while (lc--) mvCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+    } break;
+
+    /// HOME AND END or 1/3: move the cursor to the far right or left
+    case HOME_KEY:
+      config.xcursor = 0;
+      break;
+    case END_KEY:
+      config.xcursor = config.cols - 1;
+      break;
+
   }
 }
 
