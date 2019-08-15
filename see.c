@@ -1,82 +1,231 @@
 // see text editor
-// the gateway drug to vim. without colons.
-// jay lang, 2019
+// the gateway drug to vim. without colons.  // jay lang, 2019
 
 /* Include */
 
 #include <unistd.h>  // read(), stdin fd, 
+#include <string.h>  // memcpy()
 #include <termios.h> // termios struct, tcget/set, tcflags 
-#include <stdlib.h>  // atexit(), exit()
-#include <stdio.h>   // printf(), perror()
+#include <stdlib.h>  // atexit(), exit(), realloc(), free()
+#include <sys/ioctl.h> // TIOCGWINSZ, ioctl routines
+#include <stdio.h>   // printf(), perror(), snprintf()
 #include <ctype.h>   // iscntrl()
 #include <errno.h>   // errno, err flags
 
+#define SEEVER "1.0X"  // version history!
+
 /* Global data */
 
-struct termios oldConfig;                                     // termios struct describes current term config
+struct seeConfig {
+  struct termios oldConfig;                                   // termios struct describes current term config
+  int rows;                                                   // window size descriptors
+  int cols;
+  int xcursor, ycursor;                                       // Cursor position
+};
+
+struct seeConfig config;
+
 
 /* Terminal Interface */
 
 void suicide(const char *s) {                                 // Self kill function in the event of fatal err
+  write(STDOUT_FILENO, "\x1b[2J", 4);                         // x1b J2 to clear the screen
+  write(STDOUT_FILENO, "\x1b[H", 3);                          // Put the cursor at the top left (no args to H)
   perror(s);                                                  // Print out error with errno checking
   exit(1);                                                    // Exit with err code 1
 } 
 
 void rawModeOff() {
-  int statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldConfig);// Restore the backed up original config 
-  if (statrt == -1) suicide("rawModeOff.tcsetattr");              // Error checking
+  int statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &config.oldConfig);// Restore the backed up original config 
+  if (statrt == -1) suicide("rawModeOff.tcsetattr");          // Error checking
 }
 
 void rawModeOn() {
-  int statrt = tcgetattr(STDIN_FILENO, &oldConfig);           // get this by giving stdin fd pointed @ struct
-  if (statrt == -1) suicide("rawmodeOn.tcgetattr");                // Error handling
-  struct termios config = oldConfig;                          // back up the original config for restoration l8r
+  int statrt = tcgetattr(STDIN_FILENO, &config.oldConfig);   // get this by giving stdin fd pointed @ struct
+  if (statrt == -1) suicide("rawmodeOn.tcgetattr");          // Error handling
+  struct termios newConfig = config.oldConfig;               // back up the original config 
   
   /// Config changes. These are like bitmask opts.
   /// C_IFLAGS are input-specific flags
-  config.c_iflag &= (~IXON);                                  // off goes software flow control
-  config.c_iflag &= (~ICRNL);                                 // fix ctrl-M to be read as 13, no \r\n translates
-  config.c_iflag &= (~BRKINT);                                // break condition fixes (applicable on olds)
-  config.c_iflag &= (~INPCK);                                 // Parity checking enabled for accurate data trans
-  config.c_iflag &= (~ISTRIP);                                // 8th bit of each input byte shouldn't be stripped
+  newConfig.c_iflag &= (~IXON);                               // off goes software flow control
+  newConfig.c_iflag &= (~ICRNL);                              // fix ctrl-M to be read as 13, no \r\n translates
+  newConfig.c_iflag &= (~BRKINT);                             // break condition fixes (applicable on olds)
+  newConfig.c_iflag &= (~INPCK);                              // Parity checking enabled for accurate data trans
+  newConfig.c_iflag &= (~ISTRIP);                             // 8th bit of each input byte shouldn't be stripped
 
   /// C_CFLAG is a bitmask controlling basic features
-  config.c_cflag |= CS8;                                      // Input byte size set to 8 bytes
+  newConfig.c_cflag |= CS8;                                   // Input byte size set to 8 bytes
 
   /// C_OFLAGS are output/processing flags. Turn em off!
-  config.c_oflag &= (~OPOST);                                 // No carriage returns on \n, disable outprocs.
+  newConfig.c_oflag &= (~OPOST);                              // No carriage returns on \n, disable outprocs.
 
   /// C_LFLAGS are general/misc. state flags
-  config.c_lflag &= (~ECHO);                                  // echo flag echoes keypresses. gets in the way. 
-  config.c_lflag &= (~ICANON);                                // read byte by byte instead of by line. canon. off
-  config.c_lflag &= (~ISIG);                                  // disable interrupt signals. quit yourself.
-  config.c_lflag &= (~IEXTEN);                                // literal character escapes off + Ctrl-O fix
+  newConfig.c_lflag &= (~ECHO);                               // echo flag echoes keypresses. gets in the way. 
+  newConfig.c_lflag &= (~ICANON);                             // read byte by byte instead of by line. canon. off
+  newConfig.c_lflag &= (~ISIG);                               // disable interrupt signals. quit yourself.
+  newConfig.c_lflag &= (~IEXTEN);                             // literal character escapes off + Ctrl-O fix
 
   /// Set read timeout times with c_cc/ctrl chars
-  config.c_cc[VMIN] = 0;                                      // Bytes of input req'd before read returns
-  config.c_cc[VTIME] = 10;                                    // Allowing a timeout. After 1 second.
+  newConfig.c_cc[VMIN] = 0;                                   // Bytes of input req'd before read returns
+  newConfig.c_cc[VTIME] = 1;                                  // Allowing a timeout. After .1 seconds.
 
-  statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &config);       // set new atts. TCSAFLUSH waits, flushes new ins.
-  if (statrt == -1) suicide("rawModeOn.tcsetattr");               // Error handling
+  statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &newConfig);    // set new atts. TCSAFLUSH waits, flushes new ins.
+  if (statrt == -1) suicide("rawModeOn.tcsetattr");           // Error handling
   atexit(rawModeOff);                                         // be nice to the user. runs on exit() or ret main
+}
+
+char readKey() {                                              // Wait for a keypress then send it back. EZ$
+  int nrStat;                                                 // Return code for the read / err handling
+  char buf;                                                   // The boi
+
+  nrStat = read(STDIN_FILENO, &buf, 1);                       // o b t a i n
+  if (nrStat == -1 && errno != EAGAIN) suicide("readKey.read");// death and destruction / error handling 
+
+  
+  
+  return buf;
+}
+
+int windowSize(int *rows, int *cols) {                        // pass destination mem locations for us to load
+  struct winsize ws;                                          // has fields for us to fill rows n cols
+
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 ||  ws.ws_col == 0) {// account for erroneous ioctl syscalls
+    return -1;
+  } else {
+    *cols = ws.ws_col;                                        // dump the results and get out
+    *rows = ws.ws_row;
+    return 0;
+  }
+}
+
+/* String buffer / unified writes */
+struct sbuf {                                                 // Super simple string constructor we can add to
+  char *buf;                                                  // The buffer we're gonna use during construction
+  int len;                                                    // Length of our boi
+};
+
+#define SBUFSTART {NULL, 0}                                   // Constructor we can invoke for this struct
+
+void sbufAdd(struct sbuf *sb, const char *nsin, int len) {
+  char *new = realloc(sb->buf, sb->len + len);               // Autoset enough memory to handle our string
+  if (new == NULL) return;                                   // No change? Yeet.
+
+  memcpy(&new[sb->len], nsin, len);                           // Copy the new thing nsin to OLD EOB
+  sb->buf = new;                                              // Then update the ptrs - sb->buf could move
+  sb->len += len;                                             // Incrementing length also essential
+}
+
+void sbufKill(struct sbuf *sb) {
+  // happy big kill sbuf death time
+  free(sb->buf);  
+}
+
+/* Output/display handling */
+
+void drawDash(struct sbuf *sbptr) {
+  int i;                          
+  for (i = 0; i < config.rows; i++) {                         // Loop through all rows to set this up...
+    if (i == config.rows / 3) {
+      char welcome[100];                                      // Set up a buffer we'll snprint to for welcoming
+      int welcomeWr = snprintf(welcome, sizeof(welcome), "welcome to see text editor: version %s", SEEVER);
+      if (welcomeWr > config.cols) welcomeWr = config.cols;   // Truncation in the event of tiny terminals
+
+      int pad = (config.cols-welcomeWr) / 2;                  // Pick a nice center point for further padding
+      if (pad) {                                              // Make sure we actually have room to do things
+        sbufAdd(sbptr, "-", 1);                               // Beginning boyo
+        pad--;                                                // Proper decrementation
+      }
+      while (pad) {                                           // While there's still room chuck on spaces
+        sbufAdd(sbptr, " ", 1);
+        pad--;
+      }
+      sbufAdd(sbptr, welcome, welcomeWr);                     // Add the whole deal to the buffer
+
+    } else { 
+      sbufAdd(sbptr, "-", 1);                                 // Add new dashes to the buffer for all rows
+    }
+    sbufAdd(sbptr, "\x1b[K", 3);                              // Clear the following row into the buffer
+    if (i < config.rows-1) {                                  // If we haven't hit the end, also do \r\n
+      sbufAdd(sbptr, "\r\n", 2);                                 
+    }
+  }
+}
+
+void refreshScreen() {                                        
+
+  /// Use of VT100 0x1b[ escape sequences to the terminal begins
+  /// Objective: clear the entire screen and do (re)setup
+  struct sbuf sb = SBUFSTART;                                 // Make the buffer we'll continuously do things to
+
+  sbufAdd(&sb, "\x1b[?25l", 6);                               // Disable the cursor on newer terminals, cosmetics
+  sbufAdd(&sb, "\x1b[H", 3);                                  // Top left the cursor
+  drawDash(&sb);                                              // Dashes interface setting upping
+
+  /// Move the cursor based on config values.
+  /// Terminal uses 1 indexed values, we'll need to convert
+  /// Use snprint to attack escape sequences via a buffer
+  char buf[32]; 
+  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor+1, config.xcursor+1);
+  sbufAdd(&sb, buf, lenWr);
+  
+  sbufAdd(&sb, "\x1b[?25h", 6);                               // Re-enable the cursor
+
+  write(STDOUT_FILENO, sb.buf, sb.len);                       // Do one big write to STDOUT with buffer contents
+  sbufKill(&sb);                                              // Make it die
+}
+
+/* Input delegation */
+
+void mvCursor(char keyPressed) {                              // Update cursor position based on WASD keys
+  switch (keyPressed) {
+    case 'a':
+      config.xcursor--;
+      break;
+    case 'd':
+      config.xcursor++;
+      break;
+    case 'w':
+      config.ycursor--;
+      break;
+    case 's':
+      config.ycursor++;
+      break;
+  }
+}
+
+void procKeypress() {
+  char c = readKey();                                         // Get the next keypress, blocking til it arrives
+  switch (c) {                                                // Processing time - using 'q' as the quit key
+    case 'q':                                                 // If it is indeed the quit key...
+      write(STDOUT_FILENO, "\x1b[2J", 4);                     // x1b J2 to clear the screen
+      write(STDOUT_FILENO, "\x1b[H", 3);                      // Put the cursor at the top left (no args to H)
+      exit(0);                                                // Get outta here, we done
+      break;                          
+  
+    /// Generalize the directional keypresses and interface via a subfunction (above)
+    case 'w':
+    case 'a':
+    case 's':
+    case 'd':
+      mvCursor(c);
+      break;
+  }
 }
 
 /* Runtime */
 
+void initConfig() {
+  config.xcursor = 0; config.ycursor = 0;
+  if (windowSize(&config.rows, &config.cols) == -1) suicide("initConfig.windowSize");// do the big wsize set
+}
+
 int main() {
   rawModeOn();                                                // Customize terminal settings for our interface
-  char c;                                                     // buffer for read characters
+  initConfig();                                               // Set up the seeConfiguration, struct is above
 
-  /// Continuously read in chars and print em out, less it's q
+  /// Continuously process keypresses until 'q' is pressed
   while (1) {
-    c = '\0';                                                 // Give a default value for c, in case of timeout
-    int statrt = read(STDIN_FILENO, &c, 1);                   // Semantics: read(fd, dest, cnt) => cnt
-    if (statrt == -1 && errno != EAGAIN) suicide("main.read");    // EAGAIN sometimes fires if timeout on Cygwin, err
-    if (iscntrl(c)) {                                         // test whether it's printable or not
-      printf("%d\r\n", c);                                    // if not, just print the decimal identifier
-    } else {                                                  // if so...
-      printf("%d (%c) \r\n", c, c);                           // print out the decimal ID and the char
-    }
-    if (c == 'q') break;                                      // q instantly quits
+    refreshScreen();
+    procKeypress(); 
   }
 }
