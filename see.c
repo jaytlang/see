@@ -3,24 +3,36 @@
 
 /* Include */
 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <unistd.h>  // read(), stdin fd, 
 #include <string.h>  // memcpy()
 #include <termios.h> // termios struct, tcget/set, tcflags 
-#include <stdlib.h>  // atexit(), exit(), realloc(), free()
+#include <stdlib.h>  // atexit(), exit(), realloc(), free(), malloc()
 #include <sys/ioctl.h> // TIOCGWINSZ, ioctl routines
-#include <stdio.h>   // printf(), perror(), snprintf()
+#include <sys/types.h> // ssize_t
+#include <stdio.h>   // printf(), perror(), snprintf(), FILE n friends
 #include <ctype.h>   // iscntrl()
 #include <errno.h>   // errno, err flags
 
-#define SEEVER "1.0X"  // version history!
 
 /* Global data */
+
+typedef struct textRow {
+  int size;
+  char *chars;
+} textRow;
 
 struct seeConfig {
   struct termios oldConfig;                                   // termios struct describes current term config
   int rows;                                                   // window size descriptors
   int cols;
   int xcursor, ycursor;                                       // Cursor position
+  int yoffset;                                                // Offset used with scrolling
+  int numRows;                                                // Number of rows in an opened file
+  textRow *row;                                               // Actual array of rows in question
 };
 
 enum kPress {                                                 // Helps with arrow key / WASD / fxn aliasing
@@ -28,8 +40,8 @@ enum kPress {                                                 // Helps with arro
   ARROW_RIGHT = 'd',
   ARROW_UP = 'w',
   ARROW_DOWN = 's',
-  PAGE_UP = 'z',
-  PAGE_DOWN = 'c',
+  PAGE_UP = 'c',
+  PAGE_DOWN = 'z',
   DEL_KEY = 'x',
   HOME_KEY = '1',
   END_KEY = '3',
@@ -60,10 +72,10 @@ void rawModeOn() {
   /// Config changes. These are like bitmask opts.
   /// C_IFLAGS are input-specific flags
   newConfig.c_iflag &= (~IXON);                               // off goes software flow control
-  newConfig.c_iflag &= (~ICRNL);                              // fix ctrl-M to be read as 13, no \r\n translates
+  newConfig.c_iflag &= (~ICRNL);                              // fix ctrl-M to be read as 13, no \n->\r\n 
   newConfig.c_iflag &= (~BRKINT);                             // break condition fixes (applicable on olds)
-  newConfig.c_iflag &= (~INPCK);                              // Parity checking enabled for accurate data trans
-  newConfig.c_iflag &= (~ISTRIP);                             // 8th bit of each input byte shouldn't be stripped
+  newConfig.c_iflag &= (~INPCK);                              // Parity checking enabled
+  newConfig.c_iflag &= (~ISTRIP);                             // 8th bit of each input byte shouldn't strip
 
   /// C_CFLAG is a bitmask controlling basic features
   newConfig.c_cflag |= CS8;                                   // Input byte size set to 8 bytes
@@ -72,8 +84,8 @@ void rawModeOn() {
   newConfig.c_oflag &= (~OPOST);                              // No carriage returns on \n, disable outprocs.
 
   /// C_LFLAGS are general/misc. state flags
-  newConfig.c_lflag &= (~ECHO);                               // echo flag echoes keypresses. gets in the way. 
-  newConfig.c_lflag &= (~ICANON);                             // read byte by byte instead of by line. canon. off
+  newConfig.c_lflag &= (~ECHO);                               // echo flag echoes keypresses. gets in the way 
+  newConfig.c_lflag &= (~ICANON);                             // read byte by byte instead of by line. rip cn.
   newConfig.c_lflag &= (~ISIG);                               // disable interrupt signals. quit yourself.
   newConfig.c_lflag &= (~IEXTEN);                             // literal character escapes off + Ctrl-O fix
 
@@ -81,9 +93,9 @@ void rawModeOn() {
   newConfig.c_cc[VMIN] = 0;                                   // Bytes of input req'd before read returns
   newConfig.c_cc[VTIME] = 1;                                  // Allowing a timeout. After .1 seconds.
 
-  statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &newConfig);    // set new atts. TCSAFLUSH waits, flushes new ins.
+  statrt = tcsetattr(STDIN_FILENO, TCSAFLUSH, &newConfig);    // set new atts. TCSAFLUSH waits, flushes news
   if (statrt == -1) suicide("rawModeOn.tcsetattr");           // Error handling
-  atexit(rawModeOff);                                         // be nice to the user. runs on exit() or ret main
+  atexit(rawModeOff);                                         // be nice to the user. runs on exit() or ret
 }
 
 char readKey() {                                              // Wait for a keypress then send it back. EZ$
@@ -100,7 +112,7 @@ char readKey() {                                              // Wait for a keyp
     
     if (seq[0] == '[') {                                      // Correct kind of start sequence? If so
       if (seq[1] >= '0' && seq[1] <= '9') {
-        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';// Read in aanother boi and hope it's a ~ for pgops
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';// Read in aanother boi and check if ~/pg. opt
         if (seq[2] ==  '~') {                                 // If we have a match, return the correct keys
           switch (seq[1]) {                                   // And multiplex the controls
             case '1': return HOME_KEY;
@@ -128,7 +140,7 @@ char readKey() {                                              // Wait for a keyp
         case 'F': return END_KEY;
       } 
     }
-    return '\x1b';                                            // Something else. Who knows what else is in there?
+    return '\x1b';                                            // Something else. Who knows what else is there?
   } else {
     return buf;                                               // Normal key handling
   }
@@ -146,17 +158,53 @@ int windowSize(int *rows, int *cols) {                        // pass destinatio
   }
 }
 
+/* Row opts */
+
+void addRow(char *line, size_t lineLength) {
+  /// Allocate space for a new row = textRowSize * numberOfRows
+  config.row = realloc(config.row, sizeof(textRow)*(config.numRows+1));
+
+  int current = config.numRows;                             // This will dynamically change as we add more
+  config.row[current].size = lineLength;                    // Update the config - for loop this later?
+  config.row[current].chars = malloc(lineLength+1);         // Leave length for C-string terminator!!
+  memcpy(config.row[current].chars, line, lineLength);      // Copy in the line into our config file
+  config.row[current].chars[lineLength] = '\0';
+  config.numRows++;                                         // Do as mentioned and add the boi
+}
+
+/* File I/O Stuffs */
+
+void openFile(char *fname) {                                  // Should handle most file open operations
+  FILE *fptr = fopen(fname, "r");                             // Open in read mode, get a ptr to the thing.
+  if (!fptr) suicide("openFile.fopen");                       // Check that fp != 0
+
+  char *line = 0;                                             // Make a pointer and explicitly 0 initialize
+  size_t lineCap = 0;                                         // How long is it? No u. Make me memory+show me.
+  ssize_t lineLength = getline(&line, &lineCap, fptr);        // getLine(**buf, *size_t, file *fptr) 
+                                                                  // pause for pointerception ********
+  while ((lineLength = getline(&line, &lineCap, fptr)) != -1) {   // No error right? returns -1 at EOF
+    while (lineLength > 0 && ( line[lineLength - 1] == '\n' ||    // Trim off the following special characters
+                               line[lineLength - 1] == '\r' ))
+      lineLength--;
+    addRow(line, lineLength);
+  }
+  free(line);                                                 // Done, we read a line. Free that n close.
+  fclose(fptr);                                               
+
+  
+}
+
 /* String buffer / unified writes */
 struct sbuf {                                                 // Super simple string constructor we can add to
-  char *buf;                                                  // The buffer we're gonna use during construction
+  char *buf;                                                  // The buffer we're gonna use during making
   int len;                                                    // Length of our boi
 };
 
 #define SBUFSTART {NULL, 0}                                   // Constructor we can invoke for this struct
 
 void sbufAdd(struct sbuf *sb, const char *nsin, int len) {
-  char *new = realloc(sb->buf, sb->len + len);               // Autoset enough memory to handle our string
-  if (new == NULL) return;                                   // No change? Yeet.
+  char *new = realloc(sb->buf, sb->len + len);                // Autoset enough memory to handle our string
+  if (new == NULL) return;                                    // No change? Yeet.
 
   memcpy(&new[sb->len], nsin, len);                           // Copy the new thing nsin to OLD EOB
   sb->buf = new;                                              // Then update the ptrs - sb->buf could move
@@ -170,30 +218,64 @@ void sbufKill(struct sbuf *sb) {
 
 /* Output/display handling */
 
+void padWelcome(struct sbuf *sbptr, const char *msg) {
+  char welcome[100];                                           // Set up a buffer we'll snprint to for welcome
+    int welcomeWr = snprintf(welcome, sizeof(welcome), msg, "");
+      if (welcomeWr > config.cols) welcomeWr = config.cols;    // Truncation in the event of tiny terminals
+        int pad = (config.cols-welcomeWr) / 2;                 // Pick a nice center point for further padding
+        if (pad) {                                             // Make sure we actually have room to do things
+          sbufAdd(sbptr, "-", 1);                              // Beginning boyo
+          pad--;                                               // Proper decrementation
+        }
+        while (pad) {                                          // While there's still room chuck on spaces
+          sbufAdd(sbptr, " ", 1);
+          pad--;
+        }
+        sbufAdd(sbptr, welcome, welcomeWr);                    // Add the whole deal to the buffer
+}
+
+void checkScroll() {
+  if (config.ycursor < config.yoffset) {                       // Above the window? Just set equal and we done
+    config.yoffset = config.ycursor;
+  }
+  if (config.ycursor >= config.yoffset+config.rows) {          // Below is slightly more complicated
+    config.yoffset = config.ycursor - config.rows + 1;         // Increment what's at the top of the screen
+  }
+}
+
 void drawDash(struct sbuf *sbptr) {
   int i;                          
-  for (i = 0; i < config.rows; i++) {                         // Loop through all rows to set this up...
-    if (i == config.rows / 3) {
-      char welcome[100];                                      // Set up a buffer we'll snprint to for welcoming
-      int welcomeWr = snprintf(welcome, sizeof(welcome), "welcome to see text editor: version %s", SEEVER);
-      if (welcomeWr > config.cols) welcomeWr = config.cols;   // Truncation in the event of tiny terminals
-
-      int pad = (config.cols-welcomeWr) / 2;                  // Pick a nice center point for further padding
-      if (pad) {                                              // Make sure we actually have room to do things
-        sbufAdd(sbptr, "-", 1);                               // Beginning boyo
-        pad--;                                                // Proper decrementation
+  for (i = 0; i < config.rows; i++) {                          // Loop through all rows to set this up...
+    int frow = i+config.yoffset;                               // Tack on the current offset as we go
+    if (frow >= config.numRows) {                              // Oof, we're outta range
+    /// WELCOME: let's be nice! 
+      if (i >= config.numRows) {
+        if (config.numRows == 0) {
+          if (i == config.rows / 3 - 1) {
+            padWelcome(sbptr, "welcome to see text editor");       // This is exceedingly tedious.
+          } else if (i == config.rows / 3) {
+            padWelcome(sbptr, "written by Jay Lang, (c) 2019");
+          } else if (i == config.rows / 2 - 1) {
+            padWelcome(sbptr, "find the controls on the bar below as you type");
+          } else if (i ==  config.rows / 2) {
+            padWelcome(sbptr, "or, use arrow keys! you can do both here.");
+          } else if (i == config.rows / 2 + 1) {
+            padWelcome(sbptr, "special thanks to jake for inspiring the project :D");
+          } else if (i == config.rows / 2 + 2) {
+            padWelcome(sbptr, "you should send him chipotle. donation link on my git @jaytlang");
+          }
+        }
+        sbufAdd(sbptr, "-", 1);                                  // Add new dashes to the buffer for all rows
       }
-      while (pad) {                                           // While there's still room chuck on spaces
-        sbufAdd(sbptr, " ", 1);
-        pad--;
-      }
-      sbufAdd(sbptr, welcome, welcomeWr);                     // Add the whole deal to the buffer
-
-    } else { 
-      sbufAdd(sbptr, "-", 1);                                 // Add new dashes to the buffer for all rows
+    } else {
+      int len = config.row[frow].size;                           // From-file row display time. Set up len
+      if (len > config.cols) len = config.cols;                  // ...and trim it in case things get bigboi
+      sbufAdd(sbptr, config.row[frow].chars, len);               // Chuck her in
     }
-    sbufAdd(sbptr, "\x1b[K", 3);                              // Clear the following row into the buffer
-    if (i < config.rows-1) {                                  // If we haven't hit the end, also do \r\n
+
+    /// Prepare for the next line
+    sbufAdd(sbptr, "\x1b[K", 3);                              // Clear the following row into the buffer,
+    if (i < config.rows-1) {                                  // If we haven't hit the EOS, also do \r\n
       sbufAdd(sbptr, "\r\n", 2);                                 
     }
   }
@@ -203,9 +285,10 @@ void refreshScreen() {
 
   /// Use of VT100 0x1b[ escape sequences to the terminal begins
   /// Objective: clear the entire screen and do (re)setup
-  struct sbuf sb = SBUFSTART;                                 // Make the buffer we'll continuously do things to
+  checkScroll();                                              // Is scrolling necessary?
+  struct sbuf sb = SBUFSTART;                                 // Make the buffer we'll continuously do things
 
-  sbufAdd(&sb, "\x1b[?25l", 6);                               // Disable the cursor on newer terminals, cosmetics
+  sbufAdd(&sb, "\x1b[?25l", 6);                               // Disable the cursor on newer terminals, fancy
   sbufAdd(&sb, "\x1b[H", 3);                                  // Top left the cursor
   drawDash(&sb);                                              // Dashes interface setting upping
 
@@ -213,12 +296,12 @@ void refreshScreen() {
   /// Terminal uses 1 indexed values, we'll need to convert
   /// Use snprint to attack escape sequences via a buffer
   char buf[32]; 
-  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor+1, config.xcursor+1);
+  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor-config.yoffset+1, config.xcursor+1);
   sbufAdd(&sb, buf, lenWr);
   
   sbufAdd(&sb, "\x1b[?25h", 6);                               // Re-enable the cursor
 
-  write(STDOUT_FILENO, sb.buf, sb.len);                       // Do one big write to STDOUT with buffer contents
+  write(STDOUT_FILENO, sb.buf, sb.len);                       // Do one big write to STDOUT w buffer contents
   sbufKill(&sb);                                              // Make it die
 }
 
@@ -236,7 +319,7 @@ void mvCursor(char keyPressed) {                              // Update cursor p
       if (config.ycursor != 0) config.ycursor--;
       break;
     case ARROW_DOWN:
-      if (config.ycursor != (config.rows-1)) config.ycursor++;
+      if (config.ycursor < config.numRows) config.ycursor++;  // If we have file left to go down, do it
       break;
   }
 }
@@ -283,13 +366,20 @@ void procKeypress() {
 /* Runtime */
 
 void initConfig() {
-  config.xcursor = 0; config.ycursor = 0;
+  config.xcursor = 0; config.ycursor = 0;                     // Setup the cursor, and originally no rows
+  config.yoffset = 0;                                         // Row offset is obviously initially zero
+  config.numRows = 0;
+  config.row = 0;                                             // Zero initialize the pointer
+
   if (windowSize(&config.rows, &config.cols) == -1) suicide("initConfig.windowSize");// do the big wsize set
 }
 
-int main() {
+int main(int argc, char *argv[]) {
   rawModeOn();                                                // Customize terminal settings for our interface
   initConfig();                                               // Set up the seeConfiguration, struct is above
+  if (argc >= 2) {
+    openFile(argv[1]);                                        // Open something!
+  }
 
   /// Continuously process keypresses until 'q' is pressed
   while (1) {
