@@ -31,6 +31,7 @@ struct seeConfig {
   int cols;
   int xcursor, ycursor;                                       // Cursor position
   int yoffset;                                                // Offset used with scrolling
+  int xoffset;                                                // " but horizontal scrolling
   int numRows;                                                // Number of rows in an opened file
   textRow *row;                                               // Actual array of rows in question
 };
@@ -40,8 +41,8 @@ enum kPress {                                                 // Helps with arro
   ARROW_RIGHT = 'd',
   ARROW_UP = 'w',
   ARROW_DOWN = 's',
-  PAGE_UP = 'c',
-  PAGE_DOWN = 'z',
+  PAGE_UP = 'z',
+  PAGE_DOWN = 'c',
   DEL_KEY = 'x',
   HOME_KEY = '1',
   END_KEY = '3',
@@ -180,9 +181,10 @@ void openFile(char *fname) {                                  // Should handle m
 
   char *line = 0;                                             // Make a pointer and explicitly 0 initialize
   size_t lineCap = 0;                                         // How long is it? No u. Make me memory+show me.
-  ssize_t lineLength = getline(&line, &lineCap, fptr);        // getLine(**buf, *size_t, file *fptr) 
+  int lineLength;
+ /// getLine(**buf, *size_t, file *fptr) 
                                                                   // pause for pointerception ********
-  while ((lineLength = getline(&line, &lineCap, fptr)) != -1) {   // No error right? returns -1 at EOF
+  while ((lineLength = getline(&line, &lineCap, fptr)) != -1) {// No error right? returns -1 at EOF
     while (lineLength > 0 && ( line[lineLength - 1] == '\n' ||    // Trim off the following special characters
                                line[lineLength - 1] == '\r' ))
       lineLength--;
@@ -235,17 +237,26 @@ void padWelcome(struct sbuf *sbptr, const char *msg) {
 }
 
 void checkScroll() {
+  /// Vertical scrolling
   if (config.ycursor < config.yoffset) {                       // Above the window? Just set equal and we done
     config.yoffset = config.ycursor;
   }
   if (config.ycursor >= config.yoffset+config.rows) {          // Below is slightly more complicated
     config.yoffset = config.ycursor - config.rows + 1;         // Increment what's at the top of the screen
   }
+  
+  /// Horizontal scrolling
+  if (config.xcursor < config.xoffset) {                       // Is cursor position less than offset?
+    config.xoffset = config.xcursor;                           // If so scroll one back
+  }
+  if (config.xcursor >= config.xoffset+config.cols) {          // If we're over, drop the width off and add
+    config.xoffset = config.xcursor - config.cols + 1;         // Parallel to vertical scrolling code
+  }
 }
 
 void drawDash(struct sbuf *sbptr) {
   int i;                          
-  for (i = 0; i < config.rows; i++) {                          // Loop through all rows to set this up...
+  for (i = 0; i < config.rows; i++) {                          // loop through all rows to set this up...
     int frow = i+config.yoffset;                               // Tack on the current offset as we go
     if (frow >= config.numRows) {                              // Oof, we're outta range
     /// WELCOME: let's be nice! 
@@ -268,9 +279,10 @@ void drawDash(struct sbuf *sbptr) {
         sbufAdd(sbptr, "-", 1);                                  // Add new dashes to the buffer for all rows
       }
     } else {
-      int len = config.row[frow].size;                           // From-file row display time. Set up len
+      int len = config.row[frow].size - config.xoffset;          // From-file row display time. Len-off...
+      if (len < 0) len = 0;                                      // If we scrolled too far, nothing displays
       if (len > config.cols) len = config.cols;                  // ...and trim it in case things get bigboi
-      sbufAdd(sbptr, config.row[frow].chars, len);               // Chuck her in
+      sbufAdd(sbptr, &config.row[frow].chars[config.xoffset], len);  // Chuck her in
     }
 
     /// Prepare for the next line
@@ -296,7 +308,9 @@ void refreshScreen() {
   /// Terminal uses 1 indexed values, we'll need to convert
   /// Use snprint to attack escape sequences via a buffer
   char buf[32]; 
-  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor-config.yoffset+1, config.xcursor+1);
+
+  /// Note: cursor offset should refer to position on screen, not in text file
+  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor-config.yoffset+1, config.xcursor-config.xoffset+1);
   sbufAdd(&sb, buf, lenWr);
   
   sbufAdd(&sb, "\x1b[?25h", 6);                               // Re-enable the cursor
@@ -313,7 +327,7 @@ void mvCursor(char keyPressed) {                              // Update cursor p
       if (config.xcursor != 0) config.xcursor--;              // Do bounds checking for all cases
       break;
     case ARROW_RIGHT:
-      if (config.xcursor != (config.cols-1)) config.xcursor++;
+      config.xcursor++;
       break;
     case ARROW_UP:
       if (config.ycursor != 0) config.ycursor--;
@@ -325,7 +339,7 @@ void mvCursor(char keyPressed) {                              // Update cursor p
 }
 
 void procKeypress() {
-  char c = readKey();                                         // Get the next keypress, blocking til it arrives
+  char c = readKey();                                         // Get the next keypress, blocking til it here 
  
   // DEBUG
   // printf("Key pressed: %d (%c)", c, c);
@@ -367,7 +381,8 @@ void procKeypress() {
 
 void initConfig() {
   config.xcursor = 0; config.ycursor = 0;                     // Setup the cursor, and originally no rows
-  config.yoffset = 0;                                         // Row offset is obviously initially zero
+  config.yoffset = 0;                                         // Row offset is obviously initially zero,zero
+  config.xoffset = 0;
   config.numRows = 0;
   config.row = 0;                                             // Zero initialize the pointer
 
@@ -387,3 +402,5 @@ int main(int argc, char *argv[]) {
     procKeypress(); 
   }
 }
+
+ 
