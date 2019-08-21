@@ -20,7 +20,7 @@
 
 /* Global data */
 
-typedef struct textRow {
+typedef struct textRow {                                      // Struct for each row. Has a size n stuff.
   int size;
   char *chars;
 } textRow;
@@ -322,12 +322,16 @@ void refreshScreen() {
 /* Input delegation */
 
 void mvCursor(char keyPressed) {                              // Update cursor position based on WASD keys
+  /// Ensure that we're on an actual line...
+  /// yoffset is allowed to be one line past the last line
+  textRow *row = (config.xcursor >= config.rows) ? NULL : &config.row[config.ycursor];
+
   switch (keyPressed) {
     case ARROW_LEFT:
       if (config.xcursor != 0) config.xcursor--;              // Do bounds checking for all cases
       break;
     case ARROW_RIGHT:
-      config.xcursor++;
+      if (row && config.xcursor < row->size) config.xcursor++;// Does the current row exist? Are we in it?
       break;
     case ARROW_UP:
       if (config.ycursor != 0) config.ycursor--;
