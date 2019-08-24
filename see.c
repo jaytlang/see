@@ -17,19 +17,26 @@
 #include <ctype.h>   // iscntrl()
 #include <errno.h>   // errno, err flags
 
+#define TABSTOP 32
+
 
 /* Global data */
 
 typedef struct textRow {                                      // Struct for each row. Has a size n stuff.
   int size;
+  int rsize;
   char *chars;
+  char *render;
 } textRow;
 
 struct seeConfig {
   struct termios oldConfig;                                   // termios struct describes current term config
   int rows;                                                   // window size descriptors
   int cols;
+  int render;                                                 // what's actually gonna be displayed (tabs)
+  int rsize;                                                  // sizeof(above)
   int xcursor, ycursor;                                       // Cursor position
+  int rcursor;                                                // Rendered cursor x position
   int yoffset;                                                // Offset used with scrolling
   int xoffset;                                                // " but horizontal scrolling
   int numRows;                                                // Number of rows in an opened file
@@ -161,6 +168,43 @@ int windowSize(int *rows, int *cols) {                        // pass destinatio
 
 /* Row opts */
 
+/// Properly calculate the value of rcursor
+int cursorToRenderHelper(textRow *row, int xcursor) {
+  int rcursor = 0;
+  int i;
+  for (i = 0; i < xcursor; i++) {                           // Move the cursor properly
+    if (row->chars[i] == '\t') rcursor += (TABSTOP-1) - (rcursor & TABSTOP);
+    rcursor++;
+  }
+  return rcursor;
+}
+
+/// Use the chars string of the textRow to fill in render
+/// For now, directly copy things over and fix tabs
+void updateRow(textRow *row) {
+  int tabs = 0;                                             // Simple enough, do tab determination
+  int i;
+  for (i = 0; i < row->size; i++) {
+    if (row->chars[i] == '\t') tabs++;
+  }
+
+  free(row->render);                                        // Free whatever might already be there
+  row->render = malloc(row->size + 1 + tabs*(TABSTOP-1));   // Allocate space, row->size is one tab
+
+  int idx = 0;
+  for (i = 0; i < row->size; i++) {
+    if (row->chars[i] == '\t') {                            // If there's a tab add spaces until stop
+      row->render[idx++] = ' ';                             // Divisible by 8 implies stop
+      while (idx % TABSTOP != 0) row->render[idx++] = ' ';        
+    } else {
+      row->render[idx++] = row->chars[i];                   // Normal copy
+    }
+  }
+
+  row->render[idx] = '\0';                                  // After copying suppend terminator
+  row->rsize = idx;
+}
+
 void addRow(char *line, size_t lineLength) {
   /// Allocate space for a new row = textRowSize * numberOfRows
   config.row = realloc(config.row, sizeof(textRow)*(config.numRows+1));
@@ -170,6 +214,11 @@ void addRow(char *line, size_t lineLength) {
   config.row[current].chars = malloc(lineLength+1);         // Leave length for C-string terminator!!
   memcpy(config.row[current].chars, line, lineLength);      // Copy in the line into our config file
   config.row[current].chars[lineLength] = '\0';
+
+  config.row[current].rsize = 0;                            // Initialize the new render
+  config.row[current].render = 0;                           // Nothing is here yet
+  updateRow(&config.row[current]);
+
   config.numRows++;                                         // Do as mentioned and add the boi
 }
 
@@ -237,6 +286,11 @@ void padWelcome(struct sbuf *sbptr, const char *msg) {
 }
 
 void checkScroll() {
+  config.rcursor = 0;
+  if (config.ycursor < config.numRows) {
+    config.rcursor = cursorToRenderHelper(&config.row[config.ycursor], config.xcursor);
+  }
+
   /// Vertical scrolling
   if (config.ycursor < config.yoffset) {                       // Above the window? Just set equal and we done
     config.yoffset = config.ycursor;
@@ -246,11 +300,11 @@ void checkScroll() {
   }
   
   /// Horizontal scrolling
-  if (config.xcursor < config.xoffset) {                       // Is cursor position less than offset?
-    config.xoffset = config.xcursor;                           // If so scroll one back
+  if (config.rcursor < config.xoffset) {                       // Is cursor position less than offset?
+    config.xoffset = config.rcursor;                           // If so scroll one back
   }
-  if (config.xcursor >= config.xoffset+config.cols) {          // If we're over, drop the width off and add
-    config.xoffset = config.xcursor - config.cols + 1;         // Parallel to vertical scrolling code
+  if (config.rcursor >= config.xoffset+config.cols) {          // If we're over, drop the width off and add
+    config.xoffset = config.rcursor - config.cols + 1;         // Parallel to vertical scrolling code
   }
 }
 
@@ -279,10 +333,10 @@ void drawDash(struct sbuf *sbptr) {
         sbufAdd(sbptr, "-", 1);                                  // Add new dashes to the buffer for all rows
       }
     } else {
-      int len = config.row[frow].size - config.xoffset;          // From-file row display time. Len-off...
+      int len = config.row[frow].rsize - config.xoffset;         // From-file row display time. Len-off...
       if (len < 0) len = 0;                                      // If we scrolled too far, nothing displays
       if (len > config.cols) len = config.cols;                  // ...and trim it in case things get bigboi
-      sbufAdd(sbptr, &config.row[frow].chars[config.xoffset], len);  // Chuck her in
+      sbufAdd(sbptr, &config.row[frow].render[config.xoffset], len);  // Chuck her in
     }
 
     /// Prepare for the next line
@@ -310,7 +364,7 @@ void refreshScreen() {
   char buf[32]; 
 
   /// Note: cursor offset should refer to position on screen, not in text file
-  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor-config.yoffset+1, config.xcursor-config.xoffset+1);
+  int lenWr = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.ycursor-config.yoffset+1, config.rcursor-config.xoffset+1);
   sbufAdd(&sb, buf, lenWr);
   
   sbufAdd(&sb, "\x1b[?25h", 6);                               // Re-enable the cursor
@@ -323,15 +377,23 @@ void refreshScreen() {
 
 void mvCursor(char keyPressed) {                              // Update cursor position based on WASD keys
   /// Ensure that we're on an actual line...
-  /// yoffset is allowed to be one line past the last line
+  /// because yoffset is allowed to be one line past the last line
   textRow *row = (config.xcursor >= config.rows) ? NULL : &config.row[config.ycursor];
 
   switch (keyPressed) {
     case ARROW_LEFT:
       if (config.xcursor != 0) config.xcursor--;              // Do bounds checking for all cases
+      else if (config.ycursor > 0) {                          // xc = 0 but yc is valid and nonzero
+        config.ycursor--;
+        config.xcursor = config.row[config.ycursor].size;     // Decrement + end of last line
+      }
       break;
     case ARROW_RIGHT:
       if (row && config.xcursor < row->size) config.xcursor++;// Does the current row exist? Are we in it?
+      else if (row && config.xcursor == row->size) {
+        config.ycursor++;
+        config.xcursor = 0;
+      }
       break;
     case ARROW_UP:
       if (config.ycursor != 0) config.ycursor--;
@@ -340,6 +402,11 @@ void mvCursor(char keyPressed) {                              // Update cursor p
       if (config.ycursor < config.numRows) config.ycursor++;  // If we have file left to go down, do it
       break;
   }
+
+  /// ycursor now could point to a different row. Reset. 
+  row = (config.ycursor >= config.rows) ? NULL : &config.row[config.ycursor];
+  int rowLength = row ? row->size : 0;                                        // Get rowLength
+  if (config.xcursor > rowLength) config.xcursor = rowLength;                 // Compare + snap if bad
 }
 
 void procKeypress() {
@@ -385,6 +452,7 @@ void procKeypress() {
 
 void initConfig() {
   config.xcursor = 0; config.ycursor = 0;                     // Setup the cursor, and originally no rows
+  config.rcursor = 0;                                         
   config.yoffset = 0;                                         // Row offset is obviously initially zero,zero
   config.xoffset = 0;
   config.numRows = 0;
