@@ -17,7 +17,7 @@
 #include <ctype.h>   // iscntrl()
 #include <errno.h>   // errno, err flags
 
-#define TABSTOP 32
+#define TABSTOP 8
 
 
 /* Global data */
@@ -173,7 +173,7 @@ int cursorToRenderHelper(textRow *row, int xcursor) {
   int rcursor = 0;
   int i;
   for (i = 0; i < xcursor; i++) {                           // Move the cursor properly
-    if (row->chars[i] == '\t') rcursor += (TABSTOP-1) - (rcursor & TABSTOP);
+    if (row->chars[i] == '\t') rcursor += ((TABSTOP-1) - (rcursor & TABSTOP));
     rcursor++;
   }
   return rcursor;
@@ -217,7 +217,7 @@ void addRow(char *line, size_t lineLength) {
 
   config.row[current].rsize = 0;                            // Initialize the new render
   config.row[current].render = 0;                           // Nothing is here yet
-  updateRow(&config.row[current]);
+  updateRow(&config.row[current]);                          // Fix tab rendering during generation
 
   config.numRows++;                                         // Do as mentioned and add the boi
 }
@@ -403,7 +403,7 @@ void mvCursor(char keyPressed) {                              // Update cursor p
       break;
   }
 
-  /// ycursor now could point to a different row. Reset. 
+  /// ycursor now could point to a different row. Reset it.
   row = (config.ycursor >= config.rows) ? NULL : &config.row[config.ycursor];
   int rowLength = row ? row->size : 0;                                        // Get rowLength
   if (config.xcursor > rowLength) config.xcursor = rowLength;                 // Compare + snap if bad
@@ -431,10 +431,18 @@ void procKeypress() {
       break;
 
     /// Pg up / pg down operations consist of consecutive cursor moves to the top/bottom
+    /// I will never actually remember zero indexing
     case PAGE_UP:
     case PAGE_DOWN: {
+      if (c == PAGE_UP) {                                     // Scrolling up an entire page...
+        config.ycursor = config.yoffset;                      // Set the cursor to the scroll offset, then up
+      } else if (c == PAGE_DOWN) {
+        config.ycursor = config.yoffset+config.rows-1;        // Move to the bottom of the screen, -1
+        if (config.ycursor > config.numRows) config.ycursor = config.numRows;// Snap
+      }
+      
       int lc = config.rows;
-      while (lc--) mvCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+      while (lc--) mvCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);//Delegate actual positioning to this
     } break;
 
     /// HOME AND END or 1/3: move the cursor to the far right or left
@@ -474,5 +482,3 @@ int main(int argc, char *argv[]) {
     procKeypress(); 
   }
 }
-
- 
