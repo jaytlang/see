@@ -4,4 +4,4 @@
 # ...period.
 
 see: see.c
-    $(CC) see.c -o see -Wall -Wextra -pedantic -std=c99
+	$(CC) see.c -o see -Wall -Wextra -pedantic -std=c99
